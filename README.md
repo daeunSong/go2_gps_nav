@@ -1,14 +1,5 @@
 # GO2 GPS Navigation Package
 
-This package provides GPS-based navigation for robots using ROS2, featuring Dynamic Window Approach (DWA) for local obstacle avoidance.
-
-## Testing
-
-# GO2 GPS Navigation Testing Guide
-
-This simple guide explains how to test the GPS navigation package by publishing to the `/fix` and `/goal` topics.
-
-
 ## Testing
 
 1. Start the go2_bringup node:
