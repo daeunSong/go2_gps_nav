@@ -7,6 +7,7 @@ from geometry_msgs.msg import Twist
 import math
 import utm
 import numpy as np
+from transforms3d.euler import quat2euler
 
 
 class OutdoorNavigationNode(Node):
@@ -60,30 +61,6 @@ class OutdoorNavigationNode(Node):
         
         self.get_logger().info('Outdoor Navigation Node initialized')
     
-    def quaternion_to_euler(self, x, y, z, w):
-        """
-        Convert a quaternion to Euler angles (roll, pitch, yaw).
-        Source: https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles
-        """
-        # Roll (x-axis rotation)
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-        
-        # Pitch (y-axis rotation)
-        sinp = 2 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            # Use 90 degrees if out of range
-            pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            pitch = math.asin(sinp)
-        
-        # Yaw (z-axis rotation)
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        
-        return roll, pitch, yaw
     
     def calculate_utm_zone(self, latitude, longitude):
         """Calculate the UTM zone based on latitude and longitude."""
@@ -160,7 +137,7 @@ class OutdoorNavigationNode(Node):
         easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
         
         self.current_utm = (easting, northing)
-        self.get_logger().debug(f'Current UTM position: {self.current_utm}')
+        self.get_logger().info(f'Current UTM position: {self.current_utm}')
     
     def imu_callback(self, msg):
         """Callback for the IMU data."""
@@ -169,16 +146,13 @@ class OutdoorNavigationNode(Node):
         
         # Convert to Euler angles (roll, pitch, yaw)
         try:
-            # Try to use transforms3d if available
-            from transforms3d.euler import quat2euler
             roll, pitch, self.yaw = quat2euler([q.w, q.x, q.y, q.z])
-        except ImportError:
-            # Fallback to our own implementation
-            roll, pitch, self.yaw = self.quaternion_to_euler(q.x, q.y, q.z, q.w)
+        except:
+            self.get_logger().error(f'Wrong IMU oreintation value: {msg.orientation}')
         
         # IMU yaw is 0 when facing east and +90 degrees (pi/2 rad) when facing north
         # This already aligns with our ENU convention so no conversion needed
-        self.get_logger().debug(f'Current yaw: {self.yaw}')
+        self.get_logger().info(f'Current yaw: {self.yaw}')
     
     def goal_callback(self, msg):
         """Callback for the goal GPS position."""
@@ -220,7 +194,7 @@ class OutdoorNavigationNode(Node):
     def control_loop(self):
         """Main control loop to navigate to the goal."""
         if self.current_utm is None or self.goal_utm is None or self.yaw is None:
-            self.get_logger().debug('Waiting for GPS and IMU data...')
+            self.get_logger().info('Waiting for GPS and IMU data...')
             return
         
         if self.goal_reached:
@@ -267,7 +241,7 @@ class OutdoorNavigationNode(Node):
         # Publish command
         self.cmd_vel_publisher.publish(cmd_vel)
         
-        self.get_logger().debug(f'Distance to goal: {distance:.2f}m, Yaw error: {yaw_error:.2f}rad')
+        self.get_logger().info(f'Distance to goal: {distance:.2f}m, Yaw error: {yaw_error:.2f}rad')
     
     def normalize_angle(self, angle):
         """Normalize angle to [-pi, pi]."""
