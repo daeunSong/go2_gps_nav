@@ -30,6 +30,9 @@ class OutdoorNavigationNode(Node):
         self.goal_utm = None
         self.yaw = None
         self.goal_reached = False
+
+        # For logging
+        # self.imu_counter = 0
         
         # Subscribers
         self.gps_subscription = self.create_subscription(
@@ -55,89 +58,19 @@ class OutdoorNavigationNode(Node):
             Twist,
             '/cmd_vel',
             10)
-        
-        # Timer for control loop
-        self.timer = self.create_timer(0.1, self.control_loop)  # 10 Hz
+
+        self.timer = self.create_timer(0.1, self.control_loop) # 10 Hz
         
         self.get_logger().info('Outdoor Navigation Node initialized')
     
-    
-    def calculate_utm_zone(self, latitude, longitude):
-        """Calculate the UTM zone based on latitude and longitude."""
-        # UTM zones are 6 degrees wide
-        zone_number = int((longitude + 180) / 6) + 1
-        
-        # Special case for Norway and Svalbard
-        if 56 <= latitude < 64 and 3 <= longitude < 12:
-            zone_number = 32
-            
-        # Special cases for Svalbard
-        if 72 <= latitude < 84:
-            if 0 <= longitude < 9:
-                zone_number = 31
-            elif 9 <= longitude < 21:
-                zone_number = 33
-            elif 21 <= longitude < 33:
-                zone_number = 35
-            elif 33 <= longitude < 42:
-                zone_number = 37
-        
-        # UTM zone letter
-        if 84 >= latitude >= 72:
-            zone_letter = 'X'
-        elif 72 > latitude >= 64:
-            zone_letter = 'W'
-        elif 64 > latitude >= 56:
-            zone_letter = 'V'
-        elif 56 > latitude >= 48:
-            zone_letter = 'U'
-        elif 48 > latitude >= 40:
-            zone_letter = 'T'
-        elif 40 > latitude >= 32:
-            zone_letter = 'S'
-        elif 32 > latitude >= 24:
-            zone_letter = 'R'
-        elif 24 > latitude >= 16:
-            zone_letter = 'Q'
-        elif 16 > latitude >= 8:
-            zone_letter = 'P'
-        elif 8 > latitude >= 0:
-            zone_letter = 'N'
-        elif 0 > latitude >= -8:
-            zone_letter = 'M'
-        elif -8 > latitude >= -16:
-            zone_letter = 'L'
-        elif -16 > latitude >= -24:
-            zone_letter = 'K'
-        elif -24 > latitude >= -32:
-            zone_letter = 'J'
-        elif -32 > latitude >= -40:
-            zone_letter = 'H'
-        elif -40 > latitude >= -48:
-            zone_letter = 'G'
-        elif -48 > latitude >= -56:
-            zone_letter = 'F'
-        elif -56 > latitude >= -64:
-            zone_letter = 'E'
-        elif -64 > latitude >= -72:
-            zone_letter = 'D'
-        elif -72 > latitude >= -80:
-            zone_letter = 'C'
-        else:
-            zone_letter = 'Z'  # Error flag
-            
-        return zone_number, zone_letter
         
     def gps_callback(self, msg):
         """Callback for the GPS data."""
-        # Calculate UTM zone
-        zone_number, zone_letter = self.calculate_utm_zone(msg.latitude, msg.longitude)
-        
         # Convert GPS to UTM
         easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
         
         self.current_utm = (easting, northing)
-        self.get_logger().info(f'Current UTM position: {self.current_utm}')
+        # self.get_logger().info(f'Current UTM position: {self.current_utm}')
     
     def imu_callback(self, msg):
         """Callback for the IMU data."""
@@ -152,13 +85,12 @@ class OutdoorNavigationNode(Node):
         
         # IMU yaw is 0 when facing east and +90 degrees (pi/2 rad) when facing north
         # This already aligns with our ENU convention so no conversion needed
-        self.get_logger().info(f'Current yaw: {self.yaw}')
+        # if self.imu_counter % 50 == 0:
+            # self.get_logger().info(f'Current yaw: {self.yaw}')
+        # self.imu_counter += 1
     
     def goal_callback(self, msg):
-        """Callback for the goal GPS position."""
-        # Calculate UTM zone
-        zone_number, zone_letter = self.calculate_utm_zone(msg.latitude, msg.longitude)
-        
+        """Callback for the goal GPS position.""" 
         # Convert goal GPS to UTM
         easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
         
