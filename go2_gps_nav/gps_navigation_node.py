@@ -193,8 +193,11 @@ class OutdoorNavigationNode(Node):
     
     def control_loop(self):
         """Main control loop to navigate to the goal."""
-        if self.current_utm is None or self.goal_utm is None or self.yaw is None:
+        if self.current_utm is None or self.yaw is None:
             self.get_logger().info('Waiting for GPS and IMU data...')
+            return
+        if self.goal_utm is None:
+            self.get_logger().info('Waiting for target goal...')
             return
         
         if self.goal_reached:
