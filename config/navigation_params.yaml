@@ -1,0 +1,7 @@
+# Navigation parameters for GPS navigation
+gps_navigation_node:
+  ros__parameters:
+    linear_speed: 0.5  
+    angular_speed: 0.5
+    goal_threshold: 2.0 
+    yaw_threshold: 0.1
