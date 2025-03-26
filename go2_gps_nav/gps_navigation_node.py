@@ -80,14 +80,10 @@ class OutdoorNavigationNode(Node):
         # Convert to Euler angles (roll, pitch, yaw)
         try:
             roll, pitch, self.yaw = quat2euler([q.w, q.x, q.y, q.z])
+
         except:
             self.get_logger().error(f'Wrong IMU oreintation value: {msg.orientation}')
         
-        # IMU yaw is 0 when facing east and +90 degrees (pi/2 rad) when facing north
-        # This already aligns with our ENU convention so no conversion needed
-        # if self.imu_counter % 50 == 0:
-            # self.get_logger().info(f'Current yaw: {self.yaw}')
-        # self.imu_counter += 1
     
     def goal_callback(self, msg):
         """Callback for the goal GPS position.""" 
@@ -107,9 +103,7 @@ class OutdoorNavigationNode(Node):
         dx = self.goal_utm[0] - self.current_utm[0]  # East
         dy = self.goal_utm[1] - self.current_utm[1]  # North
         
-        # Calculate bearing using ENU convention
-        # In ENU, 0 radians is east, pi/2 is north
-        bearing = math.atan2(dy, dx)
+        bearing = math.pi/2 - math.atan2(dy, dx)
         
         return bearing
     
