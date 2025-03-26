@@ -103,7 +103,7 @@ class OutdoorNavigationNode(Node):
         dx = self.goal_utm[0] - self.current_utm[0]  # East
         dy = self.goal_utm[1] - self.current_utm[1]  # North
         
-        bearing = math.pi/2 - math.atan2(dy, dx)
+        bearing = math.atan2(dy, dx) -  math.pi/2
         
         return bearing
     
