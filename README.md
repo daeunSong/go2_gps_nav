@@ -55,13 +55,9 @@ Edit the configuration file at `config/navigation_params.yaml` to adjust navigat
 ```yaml
 gps_navigation_node:
   ros__parameters:
-    # Control parameters
-    kp_linear: 0.5         # Proportional gain for linear velocity
-    kp_angular: 1.0        # Proportional gain for angular velocity
-    max_linear_speed: 0.5  # Maximum linear speed (m/s)
-    max_angular_speed: 0.5 # Maximum angular speed (rad/s)
-    
-    # Goal parameters
-    goal_tolerance: 2.0    # Distance tolerance for goal (meters)
-    heading_tolerance: 0.1 # Heading tolerance (radians)
+
+    linear_speed: 0.5      # linear speed (m/s)
+    angular_speed: 0.5     # angular speed (rad/s)
+    goal_threshold: 2.0    # Distance tolerance for goal (meters)
+    yaw_threshold: 0.1     # Heading tolerance (radians)
 ```
