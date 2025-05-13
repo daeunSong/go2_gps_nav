@@ -3,267 +3,286 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix, Imu
-from geometry_msgs.msg import Twist
-import math
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Quaternion, PoseStamped
 import utm
-import numpy as np
-from transforms3d.euler import quat2euler
-from collections import deque
+import threading
+import math
+import geomag
+import tf2_ros
+import tf_transformations
+from geometry_msgs.msg import TransformStamped
+from rclpy.duration import Duration
 
 
-class OutdoorNavigationNode(Node):
+class GPS_localization(Node):
     def __init__(self):
-        super().__init__('outdoor_navigation_node')
+        super().__init__('GPS_Localization_Node')
         
-        # Parameters
-        self.declare_parameter('linear_speed', 0.5)  # Linear speed in m/s
-        self.declare_parameter('angular_speed', 0.5)  # Angular speed in rad/s
-        self.declare_parameter('goal_threshold', 2.0)  # Distance threshold to consider goal reached in meters
-        self.declare_parameter('yaw_threshold', 0.1)  # Yaw threshold in radians
-        self.declare_parameter('gps_filter_window', 10)  # Number of GPS readings to average
-        self.declare_parameter('init_duration', 10.0)  # Initialization duration in seconds
+        self.br = tf2_ros.TransformBroadcaster(self)
+
+        self._lock = threading.Lock()
+        self.start_time = self.get_clock().now()
+        self.calibrated = False
+        self.cache = []  # list of (easting, northing)
+        self.origin_easting = 0.0
+        self.origin_northing = 0.0
         
-        self.linear_speed = self.get_parameter('linear_speed').value
-        self.angular_speed = self.get_parameter('angular_speed').value
-        self.goal_threshold = self.get_parameter('goal_threshold').value
-        self.yaw_threshold = self.get_parameter('yaw_threshold').value
-        self.gps_filter_window = self.get_parameter('gps_filter_window').value
-        self.init_duration = self.get_parameter('init_duration').value
-        
-        # State variables
-        self.current_utm = None
-        self.filtered_utm = None
-        self.goal_utm = None
-        self.yaw = None
-        self.goal_reached = False
-        
-        # GPS filtering buffer
-        self.gps_buffer = deque(maxlen=self.gps_filter_window)
-        
-        # Initialization state
-        self.is_initialized = False
-        self.init_start_time = self.get_clock().now()
-        self.init_gps_buffer = []
+        # Previous GPS fix & time (for heading logic)
+        self.prev_easting = None
+        self.prev_northing = None
+        self.prev_fix_time = None
+
+        # Previous relative pose & time (for velocity)
+        self.prev_x_rel = 0.0
+        self.prev_y_rel = 0.0
+        self.prev_yaw = 0.0
+        self.prev_pose_time = None
+
+        # Filter state
+        self.vel_alpha = 0.9          # higher => smoother
+        self.filtered_vx = 0.0
+        self.filtered_vy = 0.0
+        self.filtered_yaw_rate = 0.0
+
+        # Direction (forward/back)
+        self.direction = 1
+
+        # Latest IMU orientation quaternion (x,y,z,w)
+        self.latest_orientation = (0.0, 0.0, 0.0, 1.0)
+        self.offset = 0.0
         
         # Subscribers
         self.gps_subscription = self.create_subscription(
             NavSatFix,
-            '/fix',
-            self.gps_callback,
+            "fix", # atc edit
+            self._gps_cb,
             10)
         
         self.imu_subscription = self.create_subscription(
             Imu,
-            '/witmotion_imu/imu',
-            self.imu_callback,
-            10)
+            "witmotion_imu/imu",
+            self._imu_cb,
+            100)
         
         self.goal_subscription = self.create_subscription(
             NavSatFix,
-            '/goal',
-            self.goal_callback,
+            'gps_goal',
+            self._goal_cb,
             10)
         
+
         # Publisher
-        self.cmd_vel_publisher = self.create_publisher(
-            Twist,
-            '/cmd_vel',
+        self.odom_pub = self.create_publisher(
+            Odometry,
+            'odom',
             10)
 
-        self.timer = self.create_timer(0.1, self.control_loop)  # 10 Hz
+        self.nav_goal_publisher = self.create_publisher(
+            PoseStamped,
+            'goal_pose',
+            10)
         
         self.get_logger().info('Outdoor Navigation Node initialized')
-        self.get_logger().info(f'Starting initialization phase for {self.init_duration} seconds...')
-    
-    def gps_callback(self, msg):
-        """Callback for the GPS data."""
-        # Convert GPS to UTM
-        try:
-            easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
-            
-            # Store raw UTM position
-            self.current_utm = (easting, northing)
-            
-            # During initialization phase, collect GPS readings
-            if not self.is_initialized:
-                self.init_gps_buffer.append(self.current_utm)
-                return
-            
-            # Add to filter buffer for normal operation
-            self.gps_buffer.append(self.current_utm)
-            
-            # Apply filtering (moving average)
-            if len(self.gps_buffer) > 0:
-                avg_easting = sum(pos[0] for pos in self.gps_buffer) / len(self.gps_buffer)
-                avg_northing = sum(pos[1] for pos in self.gps_buffer) / len(self.gps_buffer)
-                self.filtered_utm = (avg_easting, avg_northing)
         
-        except Exception as e:
-            self.get_logger().error(f'Error processing GPS data: {e}')
-    
-    def imu_callback(self, msg):
-        """Callback for the IMU data."""
-        # Extract orientation quaternion
-        q = msg.orientation
+    def _gps_cb(self, msg):
+        """Handle GPS fixes, calibration, pose + velocity publication."""
+        # if msg.status.status < 0:
+        #     self.get_logger().warn("Waiting for GPS good fix")
+        #     return
         
-        try:
-            # Convert to Euler angles (roll, pitch, yaw)
-            roll, pitch, self.yaw = quat2euler([q.w, q.x, q.y, q.z])
-        except Exception as e:
-            self.get_logger().error(f'Wrong IMU orientation value: {msg.orientation}')
-    
-    def goal_callback(self, msg):
-        """Callback for the goal GPS position."""
-        if not self.is_initialized:
-            self.get_logger().warn('Cannot set goal: System not initialized')
-            return
-        
-        try:
-            # Convert goal GPS to UTM
-            easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
-            
-            self.goal_utm = (easting, northing)
-            self.goal_reached = False
-            
-            # Calculate distance to goal
-            if self.filtered_utm is not None:
-                dx = self.goal_utm[0] - self.filtered_utm[0]
-                dy = self.goal_utm[1] - self.filtered_utm[1]
-                distance = math.sqrt(dx**2 + dy**2)
-                self.get_logger().info(f'New goal received: UTM {self.goal_utm}, '
-                                      f'Distance: {distance:.2f}m')
-            else:
-                self.get_logger().info(f'New goal received: UTM {self.goal_utm}')
-        
-        except Exception as e:
-            self.get_logger().error(f'Error processing goal: {e}')
-    
-    def calculate_target_bearing(self):
-        """Calculate the bearing from current position to goal in radians."""
-        if self.filtered_utm is None or self.goal_utm is None:
-            return None
-        
-        # Calculate difference in UTM coordinates
-        dx = self.goal_utm[0] - self.filtered_utm[0]  # East
-        dy = self.goal_utm[1] - self.filtered_utm[1]  # North
-        
-        # Calculate bearing using ENU convention
-        # In ENU, 0 radians is east, pi/2 is north
-        bearing = math.atan2(dy, dx)
-        
-        return bearing
-    
-    def calculate_distance_to_goal(self):
-        """Calculate the Euclidean distance to the goal."""
-        if self.filtered_utm is None or self.goal_utm is None:
-            return float('inf')
-        
-        dx = self.goal_utm[0] - self.filtered_utm[0]
-        dy = self.goal_utm[1] - self.filtered_utm[1]
-        
-        return math.sqrt(dx**2 + dy**2)
-    
-    def control_loop(self):
-        """Main control loop to navigate to the goal."""
-        # Check if initialization is complete
-        if not self.is_initialized:
-            elapsed = (self.get_clock().now() - self.init_start_time).nanoseconds / 1e9
-            
-            if elapsed >= self.init_duration and len(self.init_gps_buffer) > 0:
-                # Calculate average UTM coordinates
-                easting_sum = sum(utm_pos[0] for utm_pos in self.init_gps_buffer)
-                northing_sum = sum(utm_pos[1] for utm_pos in self.init_gps_buffer)
-                
-                avg_easting = easting_sum / len(self.init_gps_buffer)
-                avg_northing = northing_sum / len(self.init_gps_buffer)
-                
-                # Initialize the filtered_utm with the average
-                self.filtered_utm = (avg_easting, avg_northing)
-                
-                # Mark as initialized
-                self.is_initialized = True
-                self.get_logger().info('Initialization complete!')
-                self.get_logger().info(f'Initial position: UTM {self.filtered_utm}')
-            else:
-                # Stop the robot during initialization
-                cmd_vel = Twist()
-                self.cmd_vel_publisher.publish(cmd_vel)
-                return
-        
-        # Wait for required data
-        if self.filtered_utm is None or self.yaw is None:
-            self.get_logger().info('Waiting for filtered GPS and IMU data...')
-            # Stop the robot
-            cmd_vel = Twist()
-            self.cmd_vel_publisher.publish(cmd_vel)
-            return
-        
-        if self.goal_utm is None:
-            self.get_logger().info('Waiting for target goal...')
-            # Stop the robot
-            cmd_vel = Twist()
-            self.cmd_vel_publisher.publish(cmd_vel)
-            return
-        
-        if self.goal_reached:
-            # Stop the robot if goal is reached
-            cmd_vel = Twist()
-            self.cmd_vel_publisher.publish(cmd_vel)
-            return
-        
-        # Calculate distance to goal
-        distance = self.calculate_distance_to_goal()
-        
-        # Check if goal is reached
-        if distance < self.goal_threshold:
-            self.get_logger().info('Goal reached!')
-            self.goal_reached = True
-            # Stop the robot
-            cmd_vel = Twist()
-            self.cmd_vel_publisher.publish(cmd_vel)
-            return
-        
-        # Calculate target bearing
-        target_bearing = self.calculate_target_bearing()
-        if target_bearing is None:
-            return
-        
-        # Calculate yaw error (difference between current yaw and target bearing)
-        # Normalize to [-pi, pi]
-        yaw_error = self.normalize_angle(target_bearing - self.yaw)
-        
-        # Create cmd_vel message
-        cmd_vel = Twist()
-        
-        # Set angular velocity based on yaw error
-        if abs(yaw_error) > self.yaw_threshold:
-            # We need to turn first
-            cmd_vel.angular.z = self.angular_speed * np.sign(yaw_error)
-            cmd_vel.linear.x = 0.0
-        else:
-            # We're facing the right direction, move forward
-            cmd_vel.linear.x = self.linear_speed
-            # Small correction to maintain heading
-            cmd_vel.angular.z = 0.5 * self.angular_speed * np.sign(yaw_error)
-        
-        # Publish command
-        self.cmd_vel_publisher.publish(cmd_vel)
-        
-        self.get_logger().info(f'Distance to goal: {distance:.2f}m, Yaw error: {yaw_error:.2f}rad')
-    
-    def normalize_angle(self, angle):
-        """Normalize angle to [-pi, pi]."""
-        while angle > math.pi:
-            angle -= 2.0 * math.pi
-        while angle < -math.pi:
-            angle += 2.0 * math.pi
-        return angle
+        # Convert lat/lon -> UTM
+        easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
+        now = self.get_clock().now()
 
+        with self._lock:
+            # --- Calibration phase (first 5 s) ---
+            if not self.calibrated:
+                if (now - self.start_time) < Duration(seconds=5):
+                    self.cache.append((easting, northing))
+                    return
+                xs, ys = zip(*self.cache)
+                self.origin_easting = sum(xs) / len(xs)
+                self.origin_northing = sum(ys) / len(ys)
+                self.calibrated = True
+                self.get_logger().info(f"Calibrated origin at ({self.origin_easting:.3f}, {self.origin_northing:.3f})")
+
+                t = TransformStamped()
+                t.header.stamp = self.get_clock().now().to_msg()
+                t.header.frame_id = 'utm'
+                t.child_frame_id = 'map'
+
+                t.transform.translation.x = self.origin_easting
+                t.transform.translation.y = self.origin_northing
+                t.transform.translation.z = 0.0
+
+                t.transform.rotation.x = 0.0
+                t.transform.rotation.y = 0.0
+                t.transform.rotation.z = 0.0
+                t.transform.rotation.w = 1.0
+
+                # static transform: utm -> odom
+                self.br.sendTransform(t)
+
+                t.header.frame_id = 'map'
+                t.child_frame_id = 'odom'
+                t.transform.translation.x = 0.0
+                t.transform.translation.y = 0.0
+                
+                self.br.sendTransform(t)
+                # init previous fix/time & pose/time
+                self.prev_easting = easting
+                self.prev_northing = northing
+                self.prev_fix_time = now
+                self.prev_pose_time = now
+                return
+
+            # --- After calibration: pose in odom frame --- 
+            x_rel = easting - self.origin_easting
+            y_rel = northing - self.origin_northing
+
+
+            # extract IMU roll/pitch/yaw
+            roll, pitch, imu_yaw = tf_transformations.euler_from_quaternion(self.latest_orientation)
+
+            # decide heading from GPS vs IMU (same as before)
+            heading_true = imu_yaw
+            dt_fix = (now - self.prev_fix_time).nanoseconds / 1e9
+            dx = easting - self.prev_easting
+            dy = northing - self.prev_northing  
+            dist = math.hypot(dx, dy)
+            if dist > 1.0 and dt_fix < 8.0:
+                heading_true = math.atan2(dy, dx)
+                if self.direction < 0:
+                    heading_true += math.pi
+                heading_true = (heading_true + math.pi) % (2*math.pi) - math.pi
+                # update offset
+                self.offset = 0.9*self.offset + 0.1*(imu_yaw - heading_true)
+                self.prev_easting, self.prev_northing, self.prev_fix_time = easting, northing, now
+
+            # magnetic declination
+            decl = self._get_declination(msg.latitude, msg.longitude, msg.altitude)
+            yaw_corr = imu_yaw - self.offset + decl
+            yaw_corr = (yaw_corr + math.pi) % (2*math.pi) - math.pi
+
+            # build quaternion
+            q_corr = tf_transformations.quaternion_from_euler(roll, pitch, yaw_corr)
+
+            # --- Velocity estimation & filtering ---
+            dt_pose = (now - self.prev_pose_time).nanoseconds / 1e9
+            if dt_pose > 0:
+                # raw linear velocities
+                vx_raw = (x_rel - self.prev_x_rel) / dt_pose
+                vy_raw = (y_rel - self.prev_y_rel) / dt_pose
+                # raw angular velocity (yaw rate)
+                dyaw = (yaw_corr - self.prev_yaw)
+                # normalize angle difference
+                dyaw = (dyaw + math.pi) % (2*math.pi) - math.pi
+                yaw_rate_raw = dyaw / dt_pose
+
+                # low-pass filter
+                self.filtered_vx = (self.vel_alpha * self.filtered_vx +
+                                    (1 - self.vel_alpha) * vx_raw)
+                self.filtered_vy = (self.vel_alpha * self.filtered_vy +
+                                    (1 - self.vel_alpha) * vy_raw)
+                self.filtered_yaw_rate = (self.vel_alpha * self.filtered_yaw_rate +
+                                          (1 - self.vel_alpha) * yaw_rate_raw)
+
+            # update previous pose/time
+            self.prev_x_rel, self.prev_y_rel = x_rel, y_rel
+            self.prev_yaw = yaw_corr
+            self.prev_pose_time = now
+
+            # --- Broadcast and publish ---
+            # tf: odom -> base_link
+            t = TransformStamped()
+            t.header.stamp = self.get_clock().now().to_msg()
+            t.header.frame_id = 'odom'
+            t.child_frame_id = 'base_link'
+            t.transform.translation.x = x_rel
+            t.transform.translation.y = y_rel
+            t.transform.translation.z = 0.0
+            t.transform.rotation.x = q_corr[1]
+            t.transform.rotation.y = q_corr[2]
+            t.transform.rotation.z = q_corr[3]
+            t.transform.rotation.w = q_corr[0]
+
+            self.br.sendTransform(t)
+
+            t.header.frame_id = 'utm'
+            t.child_frame_id = 'map'
+            t.transform.translation.x = self.origin_easting
+            t.transform.translation.y = self.origin_northing
+            t.transform.translation.z = 0.0
+            t.transform.rotation.x = 0.0
+            t.transform.rotation.y = 0.0
+            t.transform.rotation.z = 0.0
+            t.transform.rotation.w = 1.0
+
+            self.br.sendTransform(t)
+
+            t.header.frame_id = 'map'
+            t.child_frame_id = 'odom'
+            t.transform.translation.x = 0.0
+            t.transform.translation.y = 0.0
+            self.br.sendTransform(t)
+
+            # Odometry msg
+            odom = Odometry()
+            odom.header.stamp = self.get_clock().now().to_msg()
+            odom.header.frame_id = 'odom'
+            odom.child_frame_id = 'base_link'
+            # pose
+            odom.pose.pose.position.x = x_rel
+            odom.pose.pose.position.y = y_rel
+            odom.pose.pose.orientation.x = q_corr[1]
+            odom.pose.pose.orientation.y = q_corr[2]
+            odom.pose.pose.orientation.z = q_corr[3]
+            odom.pose.pose.orientation.w = q_corr[0]
+
+            # twist
+            odom.twist.twist.linear.x = self.filtered_vx
+            odom.twist.twist.linear.y = self.filtered_vy
+            odom.twist.twist.angular.z = self.filtered_yaw_rate
+
+            self.odom_pub.publish(odom)
+
+    def _get_declination(self, lat, lon, alt):
+        """Return magnetic declination (radians) at given lat, lon, alt."""
+        deg = geomag.declination(lat, lon, alt)
+        self.get_logger().info(f"Magnetic declination: {deg:.3f}°")
+        return -math.radians(deg)
+    
+    def _imu_cb(self, msg):
+        """Cache the latest IMU orientation."""
+        q = msg.orientation
+        with self._lock:
+            self.latest_orientation = (q.w, q.x, q.y, q.z)     
+    
+    def _goal_cb(self, msg):
+        """Handle GPS goal messages."""
+        if not self.calibrated:
+            self.get_logger().warn("Position not initialized. Skipping")
+            return
+        
+        # Convert lat/lon -> UTM
+        easting, northing, _, _ = utm.from_latlon(msg.latitude, msg.longitude)
+        now = self.get_clock().now()
+
+        goal = PoseStamped()
+        goal.header.stamp = now
+        goal.header.frame_id = 'odom'
+        goal.pose.position.x = easting - self.origin_easting
+        goal.pose.position.y = northing - self.origin_northing
+        goal.pose.orientation.w = 1.0
+
+        self.get_logger().info(f'New goal received: UTM {goal}')
+        self.nav_goal_publisher.publish(goal)
 
 def main(args=None):
     rclpy.init(args=args)
     
-    node = OutdoorNavigationNode()
+    node = GPS_localization()
     
     try:
         rclpy.spin(node)
@@ -272,7 +291,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
